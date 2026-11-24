@@ -1,0 +1,63 @@
+{
+  "name": "app",
+  "private": true,
+  "workspaces": {
+    "packages": [
+      "apps/*",
+      "packages/*"
+    ],
+    "catalog": {
+      "zod": "^4.6.7",
+      "typescript": "^6.0.3",
+      "@types/bun": "^1.4.4",
+      "varlock": "1.25.0",
+      "@trpc/server": "^11.28.0",
+      "better-auth": "1.7.22",
+      "lucide-react": "^1.72.0",
+      "next-themes": "^0.4.6",
+      "react": "^19.3.1",
+      "react-dom": "^19.3.1",
+      "sonner": "^2.0.8",
+      "@trpc/client": "^11.28.0",
+      "@tailwindcss/postcss": "^4.3.5",
+      "@types/react": "^19.3.0",
+      "@types/react-dom": "^19.3.0",
+      "tailwindcss": "^4.3.5",
+      "drizzle-orm": "1.0.0-rc.5",
+      "@types/pg": "^8.23.1"
+    }
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "check-types": "turbo run check-types",
+    "dev:web": "turbo run dev -F web --",
+    "dev:server": "turbo run dev -F server --",
+    "db:push": "turbo run db:push -F @app/db --",
+    "db:studio": "turbo run db:studio -F @app/db --",
+    "db:generate": "turbo run db:generate -F @app/db --",
+    "db:migrate": "turbo run db:migrate -F @app/db --",
+    "db:start": "turbo run db:start -F @app/db --",
+    "db:watch": "turbo run db:watch -F @app/db --",
+    "db:stop": "turbo run db:stop -F @app/db --",
+    "db:down": "turbo run db:down -F @app/db --",
+    "env:generate": "varlock codegen --path ./apps/web/ && varlock codegen --path ./apps/server/ && varlock codegen --path ./packages/db/",
+    "postinstall": "varlock codegen --path ./apps/web/ && varlock codegen --path ./apps/server/ && varlock codegen --path ./packages/db/",
+    "auth:generate": "cd apps/server && bun run auth:generate"
+  },
+  "dependencies": {
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@app/config": "workspace:*",
+    "@types/bun": "catalog:",
+    "turbo": "^2.11.11",
+    "typescript": "catalog:",
+    "varlock": "catalog:"
+  },
+  "overrides": {
+    "@next/env": "npm:@varlock/nextjs-integration@2.0.1"
+  },
+  "packageManager": "bun@1.4.2"
+}

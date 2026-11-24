@@ -1,0 +1,148 @@
+name: Runner stress test
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds of sustained all-core load (throttling check)
+        default: "180"
+
+concurrency: stress
+
+env:
+  DURATION: ${{ inputs.duration || '180' }}
+
+jobs:
+  synthetic:
+    runs-on: [self-hosted, lima]
+    timeout-minutes: 30
+    steps:
+      - name: System info
+        run: |
+          {
+            echo "## Host: $(hostname) — runner $RUNNER_NAME"
+            echo '```'
+            echo "vCPUs: $(nproc)"; lscpu | grep -E 'Model name|Vendor ID' || true
+            free -h; df -h "$RUNNER_WORKSPACE" | tail -1; uname -sr
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: CPU
+        run: |
+          eps() { sysbench cpu --threads="$1" --time="$2" run | awk '/events per second/ {print $4}'; }
+          single=$(eps 1 20)
+          multi=$(eps "$(nproc)" 20)
+          echo "## CPU (sysbench, events/s)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| test | events/s |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| single-thread | $single |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| all $(nproc) threads | $multi |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| scaling | $(awk "BEGIN{printf \"%.1fx\", $multi/$single}") |" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sustained all-core load (throttling)
+        run: |
+          slices=$(( DURATION / 15 ))
+          series=()
+          for _ in $(seq 1 "$slices"); do
+            series+=("$(sysbench cpu --threads="$(nproc)" --time=15 run | awk '/events per second/ {printf "%.0f", $4}')")
+          done
+          first=${series[0]} last=${series[-1]}
+          echo "## Sustained load: ${DURATION}s, events/s per 15s slice" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "\`${series[*]}\`" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Last vs first slice: **$(awk "BEGIN{printf \"%.1f%%\", ($last-$first)*100/$first}")** (big drop = thermal throttling)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Memory
+        run: |
+          bw=$(sysbench memory --memory-block-size=1M --memory-total-size=50G --threads="$(nproc)" run \
+               | grep -oE '[0-9.]+ MiB/sec')
+          # Bounded to 70% so the OOM killer doesn't take the runner down
+          vm=$(stress-ng --vm 2 --vm-bytes 70% --timeout 30s --metrics-brief 2>&1 | awk '/vm / && /[0-9]/ {print $9; exit}')
+          echo "## Memory" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| test | result |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| sysbench bandwidth | $bw |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| stress-ng vm 70% (bogo ops/s) | ${vm:-n/a} |" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Disk
+        run: |
+          f="$RUNNER_TEMP/fio.dat"
+          run() { fio --name=t --filename="$f" --size=2G --direct=1 --ioengine=libaio --runtime=20 --time_based \
+                      --group_reporting --output-format=json "$@"; }
+          seqw=$(run --rw=write --bs=1M --iodepth=16 | jq '.jobs[0].write.bw/1024|floor')
+          seqr=$(run --rw=read --bs=1M --iodepth=16 | jq '.jobs[0].read.bw/1024|floor')
+          randrw=$(run --rw=randrw --bs=4k --iodepth=32 --numjobs=4 | jq '[.jobs[0].read.iops, .jobs[0].write.iops]|map(floor)|join(" / ")')
+          echo "## Disk (fio, direct I/O)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| test | result |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| seq write 1M | $seqw MiB/s |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| seq read 1M | $seqr MiB/s |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| rand 4k r/w IOPS | $randrw |" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up fio file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/fio.dat"
+
+      - name: Network
+        run: |
+          url=https://github.com/actions/runner/releases/download/v2.321.0/actions-runner-linux-arm64-2.321.0.tar.gz
+          speed=$(curl -fsSL -o /dev/null -w '%{speed_download}' "$url")
+          echo "## Network" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "GitHub release download: **$(awk "BEGIN{printf \"%.1f\", $speed*8/1000000}") Mbit/s**" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  nextjs-build:
+    needs: synthetic
+    runs-on: [self-hosted, lima]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Scaffold, install, build (cold) and rebuild (warm)
+        run: |
+          t() { local s=$SECONDS; "$@" >/dev/null; echo $((SECONDS - s)); }
+          rm -rf app
+          scaffold=$(t npx --yes create-next-app@latest app --yes --skip-install)
+          cd app
+          install=$(t npm install --no-audit --no-fund)
+          cold=$(t npm run build)
+          warm=$(t npm run build)
+          echo "## Next.js build" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| step | seconds |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| scaffold | $scaffold |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| npm install | $install |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| build (cold) | $cold |" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "| build (warm) | $warm |" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  docker-build:
+    needs: nextjs-build  # serialized: with several runners they'd otherwise share the CPU
+    runs-on: [self-hosted, lima]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Docker build (no cache)
+        run: |
+          s=$SECONDS
+          docker build --no-cache --pull -t stress-test:latest docker/
+          echo "## Docker build (Next.js image, no cache)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "**$((SECONDS - s))s** incl. base image pull" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Clean up
+        if: always()
+        run: docker image rm -f stress-test:latest node:22-slim && docker builder prune -af
+
+  # Same fixed workload x4. With 1 runner these queue; with N runners they
+  # contend for CPU. Compare per-job seconds and total wall time across RUNNER_COUNT.
+  parallel:
+    needs: [nextjs-build, docker-build]
+    runs-on: [self-hosted, lima]
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        n: [1, 2, 3, 4]
+    steps:
+      - name: Fixed CPU workload
+        run: |
+          start=$(date -u +%T) s=$SECONDS
+          sysbench cpu --threads="$(nproc)" --events=200000 --time=0 run >/dev/null
+          echo "## parallel job ${{ matrix.n }} on $RUNNER_NAME: $((SECONDS - s))s (started $start UTC)" | tee -a "$GITHUB_STEP_SUMMARY"

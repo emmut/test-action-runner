@@ -1,0 +1,121 @@
+name: E2E (Better-T-Stack monorepo)
+
+# Realistic monorepo e2e job: bun + turbo (Next.js web, Hono/tRPC server,
+# better-auth, Drizzle/Postgres), production build, Playwright on
+# chromium/firefox/webkit with seed/cleanup projects and CI retries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Where to run (github = GitHub-hosted ubuntu-24.04 baseline)
+        type: choice
+        options: [self-hosted, github]
+        default: self-hosted
+      workers:
+        description: JSON list of Playwright worker counts
+        default: "[1]"
+      copies:
+        description: 'JSON list; one identical job per entry, run at once (e.g. "[1,2,3]" = 3 concurrent PRs)'
+        default: "[1]"
+      repeat_each:
+        description: Run every test N times (scales the suite)
+        default: "1"
+      max_parallel:
+        description: Max matrix jobs at once (1 = sweep without overlap)
+        default: "1"
+
+jobs:
+  e2e:
+    name: e2e ${{ inputs.runner }} (workers=${{ matrix.workers }}, copy ${{ matrix.copy }})
+    runs-on: ${{ inputs.runner == 'github' && 'ubuntu-24.04' || fromJSON('["self-hosted", "lima"]') }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        workers: ${{ fromJSON(inputs.workers) }}
+        copy: ${{ fromJSON(inputs.copies) }}
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: app
+        # Random host port so concurrent runners in one VM don't clash.
+        ports: ["5432/tcp"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CI: true
+      BETTER_AUTH_SECRET: e2e-not-a-secret-but-long-enough-32ch
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: app/package.json
+
+      # Several runners share one VM, so each gets its own API/web ports (gh-runner-N -> 30N0/30N1).
+      - name: Configure ports and database
+        run: |
+          n=0; [[ $RUNNER_NAME =~ ^gh-runner-([0-9]+)$ ]] && n=$(( BASH_REMATCH[1] - 1 ))
+          api=$(( 3000 + n * 10 )) web=$(( 3001 + n * 10 ))
+          {
+            echo "DATABASE_URL=postgresql://postgres:password@localhost:${{ job.services.postgres.ports['5432'] }}/app"
+            echo "PORT=$api"; echo "API_PORT=$api"; echo "WEB_PORT=$web"
+            echo "BETTER_AUTH_URL=http://localhost:$api"
+            echo "NEXT_PUBLIC_SERVER_URL=http://localhost:$api"
+            echo "CORS_ORIGIN=http://localhost:$web"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright browsers and system deps
+        working-directory: app/apps/web
+        timeout-minutes: 10
+        # flock: concurrent runners in one VM would otherwise fight over the apt/dpkg lock.
+        run: flock /tmp/playwright-install.lock bunx playwright install --with-deps chromium firefox webkit
+
+      - name: Push DB schema
+        working-directory: app/packages/db
+        run: bun run db:push
+
+      - name: Build
+        run: bun run build
+
+      # VM-wide, so with several runners in one VM it shows their combined load.
+      - name: Start resource sampler
+        run: |
+          nohup vmstat -n -S M 2 > "$RUNNER_TEMP/vmstat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/vmstat.pid"
+
+      - name: Run E2E tests
+        working-directory: app/apps/web
+        run: bunx playwright test --workers=${{ matrix.workers }} --repeat-each=${{ inputs.repeat_each }}
+
+      - name: Resource usage during tests
+        if: ${{ !cancelled() }}
+        run: |
+          kill "$(cat "$RUNNER_TEMP/vmstat.pid")" || true
+          awk -v total="$(free -m | awk '/^Mem:/ {print $2}')" -v cpus="$(nproc)" -f "$GITHUB_WORKSPACE/runner/vmstat-summary.awk" \
+            "$RUNNER_TEMP/vmstat.log" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        if: ${{ !cancelled() && hashFiles('app/apps/web/test-results/results.json') != '' }}
+        working-directory: app/apps/web
+        run: |
+          jq -r --arg w "${{ matrix.workers }} copy ${{ matrix.copy }} on ${{ inputs.runner }}" '.stats |
+            "## E2E workers=\($w)\n| passed | failed | flaky | skipped | duration |\n|---|---|---|---|---|\n| \(.expected) | \(.unexpected) | \(.flaky) | \(.skipped) | \(.duration/1000|floor)s |"' \
+            test-results/results.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report-${{ inputs.runner }}-w${{ matrix.workers }}-c${{ matrix.copy }}
+          path: app/apps/web/playwright-report/
+          retention-days: 7
