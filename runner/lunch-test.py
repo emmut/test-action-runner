@@ -52,9 +52,9 @@ def log(msg):
 
 # ---------- orchestration ----------
 
-def dispatch(workflow, inputs):
+def dispatch(workflow, inputs, ref=None):
     before = {r["databaseId"] for r in json.loads(gh("run", "list", "-w", workflow, "-L", "20", "--json", "databaseId"))}
-    gh("workflow", "run", workflow, *[x for k, v in inputs.items() for x in ("-f", f"{k}={v}")])
+    gh("workflow", "run", workflow, *(["--ref", ref] if ref else []), *[x for k, v in inputs.items() for x in ("-f", f"{k}={v}")])
     for _ in range(40):
         time.sleep(3)
         runs = json.loads(gh("run", "list", "-w", workflow, "-L", "20", "--json", "databaseId"))

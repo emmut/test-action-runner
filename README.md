@@ -48,6 +48,17 @@ Sets up 3 runners, then runs: synthetic stress → one job at 1/2/4/6 workers �
 2 and 3 simultaneous jobs → GitHub-hosted `ubuntu-24.04` baseline (in parallel,
 remote). Writes `results/lunch-<time>.md` (tables) and `.json` (raw).
 
+## Native macOS runners (no VM)
+
+```sh
+./runner/native-test.py   # ~20-25 min; start Docker Desktop, close heavy apps first
+```
+
+Registers 5 temporary runners directly on macOS (`runner/setup-mac.sh`), runs the
+e2e job with `runner=macos`: 1 job, then 3 and 5 at once, sampling host RAM, swap
+and CPU. Writes `results/native-<time>.md`, then removes the runners. Native jobs
+run as your user with access to your home dir, so the runners don't outlive the test.
+
 ## Teardown
 
 ```sh
