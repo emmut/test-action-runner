@@ -47,4 +47,13 @@ sudo ./svc.sh start
 EOF
 done
 
+# An OOM-killed runner otherwise stays offline until restarted by hand.
+limactl shell "$VM" bash -s <<'EOF'
+for unit in /etc/systemd/system/actions.runner.*.service; do
+  sudo mkdir -p "$unit.d"
+  printf '[Service]\nRestart=always\nRestartSec=5\n' | sudo tee "$unit.d/restart.conf" >/dev/null
+done
+sudo systemctl daemon-reload
+EOF
+
 gh api "repos/$REPO/actions/runners" -q '.runners[] | "\(.name)\t\(.status)\t\([.labels[].name] | join(","))"'
