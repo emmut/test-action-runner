@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Where to run (github = GitHub-hosted ubuntu-24.04 baseline)
+        description: Where to run (self-hosted = Lima VM, github = GitHub-hosted ubuntu-24.04, macos = native macOS runner)
         type: choice
-        options: [self-hosted, github]
+        options: [self-hosted, github, macos]
         default: self-hosted
       workers:
         description: JSON list of Playwright worker counts
@@ -21,6 +21,10 @@ on:
       repeat_each:
         description: Run every test N times (scales the suite)
         default: "1"
+      skip_webkit:
+        description: Skip the WebKit project (what feature PRs would run)
+        type: boolean
+        default: false
       max_parallel:
         description: Max matrix jobs at once (1 = sweep without overlap)
         default: "1"
@@ -28,7 +32,7 @@ on:
 jobs:
   e2e:
     name: e2e ${{ inputs.runner }} (workers=${{ matrix.workers }}, copy ${{ matrix.copy }})
-    runs-on: ${{ inputs.runner == 'github' && 'ubuntu-24.04' || fromJSON('["self-hosted", "lima"]') }}
+    runs-on: ${{ inputs.runner == 'github' && 'ubuntu-24.04' || inputs.runner == 'macos' && fromJSON('["self-hosted", "macOS", "native"]') || fromJSON('["self-hosted", "lima"]') }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -38,7 +42,8 @@ jobs:
         copy: ${{ fromJSON(inputs.copies) }}
     services:
       postgres:
-        image: postgres:18
+        # Service containers are Linux-only; an empty image skips it and the macOS step below starts Postgres.
+        image: ${{ inputs.runner != 'macos' && 'postgres:18' || '' }}
         env:
           POSTGRES_PASSWORD: password
           POSTGRES_DB: app
@@ -48,6 +53,7 @@ jobs:
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       CI: true
+      E2E_SKIP_WEBKIT: ${{ inputs.skip_webkit }}
       BETTER_AUTH_SECRET: e2e-not-a-secret-but-long-enough-32ch
     defaults:
       run:
@@ -55,15 +61,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Native macOS runners use the host's bun; setup-bun would overwrite ~/.bun/bin under parallel jobs.
       - uses: oven-sh/setup-bun@v2
+        if: runner.os == 'Linux'
         with:
           bun-version-file: app/package.json
 
-      # Several runners share one VM, so each gets its own API/web ports (gh-runner-N -> 30N0/30N1).
+      # Several runners share one machine, so each gets its own API/web ports (<name>-N -> base+10(N-1)).
       - name: Configure ports and database
         run: |
-          n=0; [[ $RUNNER_NAME =~ ^gh-runner-([0-9]+)$ ]] && n=$(( BASH_REMATCH[1] - 1 ))
-          api=$(( 3000 + n * 10 )) web=$(( 3001 + n * 10 ))
+          n=0; [[ $RUNNER_NAME =~ -([0-9]+)$ ]] && n=$(( BASH_REMATCH[1] - 1 ))
+          base=3000; [ "$RUNNER_OS" = macOS ] && base=4000  # keep clear of local dev servers on 3001-3003
+          api=$(( base + n * 10 )) web=$(( base + 1 + n * 10 ))
           {
             echo "DATABASE_URL=postgresql://postgres:password@localhost:${{ job.services.postgres.ports['5432'] }}/app"
             echo "PORT=$api"; echo "API_PORT=$api"; echo "WEB_PORT=$web"
@@ -72,6 +81,14 @@ jobs:
             echo "CORS_ORIGIN=http://localhost:$web"
           } >> "$GITHUB_ENV"
 
+      - name: Start Postgres (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          name="pg-$GITHUB_RUN_ID-$RUNNER_NAME"
+          docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=password -e POSTGRES_DB=app -p 127.0.0.1::5432 postgres:18
+          until docker exec "$name" pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+          echo "DATABASE_URL=postgresql://postgres:password@localhost:$(docker port "$name" 5432 | head -1 | cut -d: -f2)/app" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
@@ -79,7 +96,13 @@ jobs:
         working-directory: app/apps/web
         timeout-minutes: 10
         # flock: concurrent runners in one VM would otherwise fight over the apt/dpkg lock.
-        run: flock /tmp/playwright-install.lock bunx playwright install --with-deps chromium firefox webkit
+        run: |
+          browsers="chromium firefox"; [ "$E2E_SKIP_WEBKIT" = true ] || browsers="$browsers webkit"
+          if [ "$RUNNER_OS" = Linux ]; then
+            flock /tmp/playwright-install.lock bunx playwright install --with-deps $browsers
+          else
+            bunx playwright install $browsers
+          fi
 
       - name: Push DB schema
         working-directory: app/packages/db
@@ -89,7 +112,9 @@ jobs:
         run: bun run build
 
       # VM-wide, so with several runners in one VM it shows their combined load.
+      # macOS: sampled host-side for the whole run instead (no vmstat/free/nproc there).
       - name: Start resource sampler
+        if: runner.os == 'Linux'
         run: |
           nohup vmstat -n -S M 2 > "$RUNNER_TEMP/vmstat.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/vmstat.pid"
@@ -99,7 +124,7 @@ jobs:
         run: bunx playwright test --workers=${{ matrix.workers }} --repeat-each=${{ inputs.repeat_each }}
 
       - name: Resource usage during tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
           kill "$(cat "$RUNNER_TEMP/vmstat.pid")" || true
           awk -v total="$(free -m | awk '/^Mem:/ {print $2}')" -v cpus="$(nproc)" -f "$GITHUB_WORKSPACE/runner/vmstat-summary.awk" \
@@ -119,3 +144,7 @@ jobs:
           name: playwright-report-${{ inputs.runner }}-w${{ matrix.workers }}-c${{ matrix.copy }}
           path: app/apps/web/playwright-report/
           retention-days: 7
+
+      - name: Stop Postgres (macOS)
+        if: ${{ always() && runner.os == 'macOS' }}
+        run: docker rm -f "pg-$GITHUB_RUN_ID-$RUNNER_NAME" || true

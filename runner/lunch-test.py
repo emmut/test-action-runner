@@ -52,9 +52,9 @@ def log(msg):
 
 # ---------- orchestration ----------
 
-def dispatch(workflow, inputs):
+def dispatch(workflow, inputs, ref=None):
     before = {r["databaseId"] for r in json.loads(gh("run", "list", "-w", workflow, "-L", "20", "--json", "databaseId"))}
-    gh("workflow", "run", workflow, *[x for k, v in inputs.items() for x in ("-f", f"{k}={v}")])
+    gh("workflow", "run", workflow, *(["--ref", ref] if ref else []), *[x for k, v in inputs.items() for x in ("-f", f"{k}={v}")])
     for _ in range(40):
         time.sleep(3)
         runs = json.loads(gh("run", "list", "-w", workflow, "-L", "20", "--json", "databaseId"))
@@ -164,7 +164,7 @@ def report(data):
         out += ["## Synthetic", "", "| metric | value |", "|---|---|",
                 f"| CPU single-thread (sysbench events/s) | {get('cpu_single')} |",
                 f"| CPU all {get('vcpus')} vCPU (events/s) | {get('cpu_multi')} |",
-                f"| Sustained 300s: last vs first slice | {get('throttle')}% |",
+                f"| Sustained 300s: last vs first slice (negative = throttling) | {get('throttle')}% |",
                 f"| Memory bandwidth | {get('mem_bw')} MiB/s |",
                 f"| Disk seq write / read | {get('disk_seq_w')} / {get('disk_seq_r')} MiB/s |",
                 f"| Disk random 4k IOPS (r / w) | {get('disk_rand')} |",
@@ -189,19 +189,21 @@ def report(data):
     capacity = 1 if solo else None
     if conc:
         out += ["## Several jobs at once (simultaneous PRs)", "",
-                "| scenario | jobs | slowest test time | vs solo | failed | flaky | peak RAM (VM) | run queue avg / max |",
+                "| scenario | jobs ok | slowest test time | vs solo | failed tests | flaky | peak RAM (VM) | run queue avg / max |",
                 "|---|---|---|---|---|---|---|---|"]
         for key in conc:
             cells = [e2e_cells(j) for j in runs[key]["jobs"]]
             times = [c["test_s"] for c in cells if c["test_s"]]
             slowest = max(times) if times else None
             failed = sum(c["failed"] for c in cells if isinstance(c["failed"], int))
+            # A job killed before tests (e.g. OOM during build) has no test results but still failed.
+            ok = sum(j["conclusion"] == "success" for j in runs[key]["jobs"])
             flaky = sum(c["flaky"] for c in cells if isinstance(c["flaky"], int))
             ratio = f"{slowest / solo:.2f}×" if slowest and solo else "—"
             worst = max(runs[key]["jobs"], key=lambda j: (j.get("runq") or [0, 0, 0])[1])
             w = e2e_cells(worst)
-            out.append(f"| {key} | {len(cells)} | {fmt_s(slowest)} | {ratio} | {failed} | {flaky} | {w['ram']} | {w['runq']} |")
-            if solo and slowest and failed == 0 and slowest <= 1.5 * solo and "-w" not in key:
+            out.append(f"| {key} | {ok}/{len(cells)} | {fmt_s(slowest)} | {ratio} | {failed} | {flaky} | {w['ram']} | {w['runq']} |")
+            if solo and slowest and failed == 0 and ok == len(cells) and slowest <= 1.5 * solo and "-w" not in key:
                 capacity = max(capacity, len(cells))
         out.append("")
 
@@ -227,7 +229,7 @@ def report(data):
             out.append("")
 
     out += ["## How to read this", "",
-            "- Capacity rule: most simultaneous jobs with 0 failures and slowest job ≤ 1.5× a solo job.",
+            "- Capacity rule: most simultaneous jobs, all succeeding, with 0 failed tests and slowest job ≤ 1.5× a solo job.",
             "- Run queue above the vCPU count means CPU-bound; RAM % near 90+ means memory-bound.",
             "- These numbers are this Mac's chip in a Linux VM. A candidate with more CPU throughput and the same RAM"
             " raises capacity only if the run queue, not RAM, is the limit here.", "",
@@ -273,8 +275,13 @@ def main():
     log(f"Preparing VM and {RUNNERS} runners (runner/setup.sh)")
     subprocess.run([str(ROOT / "runner/setup.sh")], env={**os.environ, "RUNNER_COUNT": str(RUNNERS)}, check=True,
                    stdout=subprocess.DEVNULL)
-    online = int(sh("gh", "api", f"repos/{REPO}/actions/runners", "--jq", '[.runners[] | select(.status=="online")] | length'))
-    if online < RUNNERS:
+    # Freshly started runners take a few seconds to connect.
+    for _ in range(12):
+        online = int(sh("gh", "api", f"repos/{REPO}/actions/runners", "--jq", '[.runners[] | select(.status=="online")] | length'))
+        if online >= RUNNERS:
+            break
+        time.sleep(5)
+    else:
         sys.exit(f"Only {online}/{RUNNERS} runners online")
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")

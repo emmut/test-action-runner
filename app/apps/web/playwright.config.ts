@@ -4,6 +4,8 @@ const CI = !!process.env.CI;
 // Overridable so several runners can share one machine.
 const API_PORT = process.env.API_PORT ?? "3000";
 const WEB_PORT = process.env.WEB_PORT ?? "3001";
+// WebKit is the slowest browser by far; CI can skip it (e.g. on feature PRs).
+const SKIP_WEBKIT = process.env.E2E_SKIP_WEBKIT === "true";
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -30,7 +32,7 @@ export default defineConfig({
         ["firefox", "Desktop Firefox"],
         ["webkit", "Desktop Safari"],
       ] as const
-    ).map(([name, device]) => ({
+    ).filter(([name]) => !(SKIP_WEBKIT && name === "webkit")).map(([name, device]) => ({
       name,
       use: { ...devices[device] },
       dependencies: ["setup"],
