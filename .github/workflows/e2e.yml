@@ -21,6 +21,10 @@ on:
       repeat_each:
         description: Run every test N times (scales the suite)
         default: "1"
+      skip_webkit:
+        description: Skip the WebKit project (what feature PRs would run)
+        type: boolean
+        default: false
       max_parallel:
         description: Max matrix jobs at once (1 = sweep without overlap)
         default: "1"
@@ -49,6 +53,7 @@ jobs:
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       CI: true
+      E2E_SKIP_WEBKIT: ${{ inputs.skip_webkit }}
       BETTER_AUTH_SECRET: e2e-not-a-secret-but-long-enough-32ch
     defaults:
       run:
@@ -92,10 +97,11 @@ jobs:
         timeout-minutes: 10
         # flock: concurrent runners in one VM would otherwise fight over the apt/dpkg lock.
         run: |
+          browsers="chromium firefox"; [ "$E2E_SKIP_WEBKIT" = true ] || browsers="$browsers webkit"
           if [ "$RUNNER_OS" = Linux ]; then
-            flock /tmp/playwright-install.lock bunx playwright install --with-deps chromium firefox webkit
+            flock /tmp/playwright-install.lock bunx playwright install --with-deps $browsers
           else
-            bunx playwright install chromium firefox webkit
+            bunx playwright install $browsers
           fi
 
       - name: Push DB schema
